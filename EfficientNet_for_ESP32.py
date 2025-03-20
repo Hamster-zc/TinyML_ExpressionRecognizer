@@ -9,10 +9,11 @@ import numpy as np
 from sklearn.metrics import confusion_matrix
 import seaborn as sns
 import os
-
+from tensorflow_model_optimization.sparsity import keras as sparsity  # 新增剪枝库
+from tensorflow_model_optimization.sparsity.keras import strip_pruning  # 新增
 
 # 模型构建函数（面向嵌入式设备优化）
-def build_esp32_model(input_shape=(48, 48, 1), num_classes=7):
+def build_esp32_model(input_shape=(48, 48, 1), num_classes=7,pruning=False):
     # 使用EfficientNetB0基础架构（无预训练权重）
     base_model = EfficientNetB0(
         include_top=False,
@@ -30,6 +31,20 @@ def build_esp32_model(input_shape=(48, 48, 1), num_classes=7):
         layers.Dense(num_classes, activation='softmax')
     ])
 
+    if pruning:
+        pruning_params = {
+            'pruning_schedule': sparsity.PolynomialDecay(
+                initial_sparsity=0.30,
+                final_sparsity=0.75,
+                begin_step=3000,
+                end_step=10000,
+                frequency=100
+            )
+        }
+        # 仅对全连接层剪枝
+        for i, layer in enumerate(model.layers):
+            if isinstance(layer, layers.Dense):
+                model.layers[i] = sparsity.prune_low_magnitude(layer, **pruning_params)
     # 计算复杂度分析
     print("模型参数统计：")
     model.summary()
@@ -53,25 +68,30 @@ def create_datagen():
     )
 
 # 训练可视化回调
-def create_callbacks():
-    return [
+def create_callbacks(pruning=False):
+    callbacks = [
         TensorBoard(log_dir='./logs', histogram_freq=0, profile_batch=0),
         ReduceLROnPlateau(
             monitor='val_accuracy',  # 监控验证精度
             factor=0.5,              
-            patience=6,              # 6轮无提升即调整
+            patience=10,              # 10轮无提升即调整
             mode='max',
             min_lr=1e-5
         ),
-        EarlyStopping(monitor='val_accuracy', patience=20, mode='max',restore_best_weights=True),
+        EarlyStopping(monitor='val_accuracy', patience=30, mode='max',restore_best_weights=True),
         ModelCheckpoint('esp32_model.h5', monitor='val_accuracy', 
                        save_best_only=True, mode='max')
     ]
+    # 添加剪枝回调 Modified
+    if pruning:
+        callbacks.append(sparsity.UpdatePruningStep())
+    
+    return callbacks
 
 # 混淆矩阵可视化（新增功能）
 def plot_confusion_matrix(model, generator):
     y_true = generator.classes
-    y_pred = model.predict(generator)
+    y_pred = model.predict(generator, steps=generator.samples // generator.batch_size + 1)
     y_pred_classes = np.argmax(y_pred, axis=1)
     
     cm = confusion_matrix(y_true, y_pred_classes)
@@ -94,7 +114,7 @@ def plot_confusion_matrix(model, generator):
 def train_model():
     # 超参数配置
     BATCH_SIZE = 96      # 增大批次减少内存碎片
-    EPOCHS = 60
+    EPOCHS = 100
     INPUT_SHAPE = (48, 48, 1)
 
     # 数据管道配置
@@ -119,62 +139,128 @@ def train_model():
         class_mode='categorical',
         shuffle=False
     )
-
-    # 模型构建与编译
-    model = build_esp32_model(INPUT_SHAPE)
-
-    # 新增权重加载代码
-    try:
-        model.load_weights('esp32_model.h5')
-        print("成功加载已有权重！")
-    # 调整初始学习率为上次训练结束时的值（可选）
-        initial_lr = 2e-3 * (0.96 ** (EPOCHS // 5)) 
-    except Exception as e:
-        print(f"未找到权重文件，将从头开始训练。错误信息：{str(e)}")
+    # 第一阶段：基础训练 Modified
+    print("\n=== 基础训练阶段 ===")
+    model = build_esp32_model(INPUT_SHAPE, pruning=False)
     model.compile(
-    optimizer=optimizers.Nadam(learning_rate=8e-4),  # 初始学习率
-    loss='categorical_crossentropy',
-    metrics=['accuracy']
-)
-
-    # 模型训练
+        optimizer=optimizers.Nadam(learning_rate=1e-3),
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
     history = model.fit(
         train_generator,
         steps_per_epoch=train_generator.samples // BATCH_SIZE,
-        epochs=EPOCHS,
+        epochs=int(EPOCHS*0.5),  # 50%训练时间用于基础训练
         validation_data=val_generator,
         validation_steps=val_generator.samples // BATCH_SIZE,
-        callbacks=create_callbacks(),
+        callbacks=create_callbacks(pruning=False),
         verbose=2
     )
 
+    # 第二阶段：剪枝训练 Modified
+    print("\n=== 剪枝训练阶段 ===")
+    pruned_model = build_esp32_model(INPUT_SHAPE, pruning=True)
+    pruned_model.compile(
+        optimizer=optimizers.Nadam(learning_rate=1e-4),  # 降低学习率
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    pruning_history = pruned_model.fit(
+        train_generator,
+        steps_per_epoch=train_generator.samples // BATCH_SIZE,
+        epochs=int(EPOCHS*0.3),  # 30%时间用于剪枝
+        validation_data=val_generator,
+        validation_steps=val_generator.samples // BATCH_SIZE,
+        callbacks=create_callbacks(pruning=True),
+        verbose=2
+    )
+
+    # 第三阶段：微调训练 Modified
+    print("\n=== 微调阶段 ===")
+    final_model = strip_pruning(pruned_model)  # 移除剪枝包装
+    final_model.compile(
+        optimizer=optimizers.Nadam(learning_rate=1e-5),  # 更低学习率
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    fine_tune_history = final_model.fit(
+        train_generator,
+        steps_per_epoch=train_generator.samples // BATCH_SIZE,
+        epochs=int(EPOCHS*0.2),  # 20%时间用于微调
+        validation_data=val_generator,
+        validation_steps=val_generator.samples // BATCH_SIZE,
+        callbacks=create_callbacks(pruning=False),
+        verbose=2
+    )
+
+    # 保存最终模型 Modified
+    final_model.save('esp32_model_pruned.h5')
+
+    # 合并历史记录 Modified
+    full_history = {
+        'accuracy': history.history['accuracy'] + pruning_history.history['accuracy'] + fine_tune_history.history['accuracy'],
+        'val_accuracy': history.history['val_accuracy'] + pruning_history.history['val_accuracy'] + fine_tune_history.history['val_accuracy'],
+        'loss': history.history['loss'] + pruning_history.history['loss'] + fine_tune_history.history['loss'],
+        'val_loss': history.history['val_loss'] + pruning_history.history['val_loss'] + fine_tune_history.history['val_loss']
+    }
+
     # 训练过程可视化
-    visualize_training(history)
+    visualize_training(full_history)
     # 生成混淆矩阵
-    plot_confusion_matrix(model, val_generator)
+    plot_confusion_matrix(final_model, val_generator)
 
 def visualize_training(history):
     plt.figure(figsize=(12, 5))
     
-    # Accuracy Plot
+    # 计算阶段边界 Modified
+    total_epochs = len(history['accuracy'])
+    base_end = int(total_epochs * 0.5)   # 基础训练结束位置
+    prune_end = base_end + int(total_epochs * 0.3)  # 剪枝训练结束位置
+    
+    # ------------------- 准确率曲线 -------------------
     plt.subplot(1, 2, 1)
-    plt.plot(history.history['accuracy'], label='Training Set')
-    plt.plot(history.history['val_accuracy'], label='Validation Set')
+    plt.plot(history['accuracy'], label='Training Set')
+    plt.plot(history['val_accuracy'], label='Validation Set')
+    
+    # 添加阶段分割线 Added
+    plt.axvline(x=base_end, color='r', linestyle='--', linewidth=1, alpha=0.7)
+    plt.axvline(x=prune_end, color='g', linestyle='--', linewidth=1, alpha=0.7)
+    
+    # 添加阶段标签 Added
+    plt.text(base_end//2, 0.1, 'Base Train', ha='center', va='center', 
+            backgroundcolor='w', fontsize=9)
+    plt.text(base_end + (prune_end-base_end)//2, 0.1, '剪枝训练', ha='center', 
+            va='center', backgroundcolor='w', fontsize=9)
+    plt.text(prune_end + (total_epochs-prune_end)//2, 0.1, '微调阶段', 
+            ha='center', va='center', backgroundcolor='w', fontsize=9)
+    
     plt.title('Accuracy Curve')
     plt.ylabel('Accuracy')
     plt.xlabel('Epochs')
     plt.legend()
     
-    # Loss Plot
+    # ------------------- 损失曲线 -------------------
     plt.subplot(1, 2, 2)
-    plt.plot(history.history['loss'], label='Training Set')
-    plt.plot(history.history['val_loss'], label='Validation Set')
+    plt.plot(history['loss'], label='Training Set')
+    plt.plot(history['val_loss'], label='Validation Set')
+    
+    # 添加阶段分割线 Added
+    plt.axvline(x=base_end, color='r', linestyle='--', linewidth=1, alpha=0.7,
+               label='Phase Transition')
+    plt.axvline(x=prune_end, color='g', linestyle='--', linewidth=1, alpha=0.7)
+    
     plt.title('Loss Curve')
     plt.ylabel('Loss Value')
     plt.xlabel('Epochs')
     plt.legend()
     
     plt.tight_layout()
+    
+    # 添加全局图例说明 Added
+    plt.figtext(0.5, 0.01, 
+               f"Phase Division: | 0-{base_end} (Base) | {base_end}-{prune_end} (Prune) | {prune_end}-{total_epochs} (Fine-tune) |",
+               ha='center', fontsize=9, color='gray')
+    
     plt.savefig('training_metrics.png')
     plt.show()
 
