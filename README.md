@@ -1,7 +1,5 @@
-# TinyML_ExpressionRecognizer
+# TinyML:EfficientNet-based Facial Expression Recognition Model
 It is a repository for our grade-one-program
-
-# EfficientNet-based Facial Expression Recognition Model
 ## Project Description
 This project focuses on building an automatic facial expression recognition model using EfficientNet and successfully deploying it on ESP32. It aims to achieve efficient and accurate facial expression recognition suitable for resource-constrained embedded environments.
 ## Key Features
