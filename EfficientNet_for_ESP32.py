@@ -11,9 +11,10 @@ import seaborn as sns
 import os
 from tensorflow_model_optimization.sparsity import keras as sparsity  # 新增剪枝库
 from tensorflow_model_optimization.sparsity.keras import strip_pruning  # 新增
+from tensorflow.keras.experimental import CosineDecayRestarts  # 新增余弦退火学习率
 
 # 模型构建函数（面向嵌入式设备优化）
-def build_esp32_model(input_shape=(48, 48, 1), num_classes=7,pruning=False):
+def build_esp32_model(input_shape=(48, 48, 1), num_classes=7,pruning=False,phase='base'):
     # 使用EfficientNetB0基础架构（无预训练权重）
     base_model = EfficientNetB0(
         include_top=False,
@@ -22,10 +23,19 @@ def build_esp32_model(input_shape=(48, 48, 1), num_classes=7,pruning=False):
         pooling='avg',  # 直接使用全局平均池化
     )
 
+    reg_config = {
+        'base': {'act_l1':1e-6, 'act_l2':1e-5, 'kernel_l1':1e-5, 'kernel_l2':1e-4},
+        'prune': {'act_l1':1e-7, 'act_l2':1e-6, 'kernel_l1':1e-6, 'kernel_l2':1e-5},
+        'fine_tune': {'act_l1':0, 'act_l2':0, 'kernel_l1':0, 'kernel_l2':0}
+    }[phase]
     # 轻量级分类头设计
     model = models.Sequential([
         base_model,
-        layers.Dense(128, activation='swish', kernel_regularizer=tf.keras.regularizers.l1_l2(0.0001,0.001)),  # 新增带正则化的中间层
+        layers.Dense(128, activation='swish', 
+                     activity_regularizer=tf.keras.regularizers.l1_l2(l1=reg_config['act_l1'],
+                                                                      l2=reg_config['act_l2']),  # 通道级正则化
+                     kernel_regularizer=tf.keras.regularizers.l1_l2(l1=reg_config['kernel_l1'],
+                                                                    l2=reg_config['kernel_l2'])),  # 新增带正则化的中间层
         layers.BatchNormalization(),  # 新增BN层
         layers.Dropout(0.2),  
         layers.Dense(num_classes, activation='softmax')
@@ -34,11 +44,11 @@ def build_esp32_model(input_shape=(48, 48, 1), num_classes=7,pruning=False):
     if pruning:
         pruning_params = {
             'pruning_schedule': sparsity.PolynomialDecay(
-                initial_sparsity=0.30,
-                final_sparsity=0.75,
-                begin_step=3000,
-                end_step=10000,
-                frequency=100
+                initial_sparsity=0.20,
+                final_sparsity=0.45,
+                begin_step=2000,
+                end_step=15000,
+                frequency=300
             )
         }
         # 仅对全连接层剪枝
@@ -64,27 +74,29 @@ def create_datagen():
         horizontal_flip=True,
         fill_mode='constant',       
         preprocessing_function=lambda x: x * (1 + np.random.uniform(-0.03,0.03)) # 亮度抖动
-
     )
 
 # 训练可视化回调
 def create_callbacks(pruning=False):
     callbacks = [
         TensorBoard(log_dir='./logs', histogram_freq=0, profile_batch=0),
-        ReduceLROnPlateau(
-            monitor='val_accuracy',  # 监控验证精度
-            factor=0.5,              
-            patience=10,              # 10轮无提升即调整
-            mode='max',
-            min_lr=1e-5
-        ),
-        EarlyStopping(monitor='val_accuracy', patience=30, mode='max',restore_best_weights=True),
+        EarlyStopping(monitor='val_accuracy', 
+                      patience=15, 
+                      min_delta=0.005,
+                      mode='max',
+                      restore_best_weights=True),
         ModelCheckpoint('esp32_model.h5', monitor='val_accuracy', 
                        save_best_only=True, mode='max')
     ]
     # 添加剪枝回调 Modified
     if pruning:
-        callbacks.append(sparsity.UpdatePruningStep())
+        callbacks.append(
+            ModelCheckpoint('prune_checkpoint.h5', 
+                monitor='val_accuracy',
+                save_best_only=True,
+                mode='max',
+                save_format='tf')
+)
     
     return callbacks
 
@@ -114,7 +126,11 @@ def plot_confusion_matrix(model, generator):
 def train_model():
     # 超参数配置
     BATCH_SIZE = 96      # 增大批次减少内存碎片
-    EPOCHS = 100
+    EPOCHS = 120
+    # 阶段分配调整为：
+    # 基础训练：0-60轮 (50%)
+    # 剪枝训练：60-90轮 (25%)
+    # 微调训练：90-120轮 (25%)
     INPUT_SHAPE = (48, 48, 1)
 
     # 数据管道配置
@@ -139,9 +155,9 @@ def train_model():
         class_mode='categorical',
         shuffle=False
     )
-    # 第一阶段：基础训练 Modified
+    # 第一阶段：基础训练
     print("\n=== 基础训练阶段 ===")
-    model = build_esp32_model(INPUT_SHAPE, pruning=False)
+    model = build_esp32_model(INPUT_SHAPE, pruning=False,phase='base')
     model.compile(
         optimizer=optimizers.Nadam(learning_rate=1e-3),
         loss='categorical_crossentropy',
@@ -157,14 +173,23 @@ def train_model():
         verbose=2
     )
 
-    # 第二阶段：剪枝训练 Modified
+    # 第二阶段：剪枝训练 
     print("\n=== 剪枝训练阶段 ===")
-    pruned_model = build_esp32_model(INPUT_SHAPE, pruning=True)
+    pruned_model = build_esp32_model(INPUT_SHAPE, phase='prune',pruning=True)
+    total_steps = (train_generator.samples // BATCH_SIZE) * int(EPOCHS*0.3)  # 计算总步数
     pruned_model.compile(
-        optimizer=optimizers.Nadam(learning_rate=1e-4),  # 降低学习率
-        loss='categorical_crossentropy',
-        metrics=['accuracy']
-    )
+    optimizer=optimizers.Adam(
+            learning_rate = CosineDecayRestarts(
+            initial_learning_rate=3e-4,  # 基础学习率提升50%
+            first_decay_steps=total_steps//3,
+            t_mul=2.0,
+            m_mul=0.7
+        )
+    ),
+    loss='categorical_crossentropy',
+    metrics=['accuracy']
+)
+    
     pruning_history = pruned_model.fit(
         train_generator,
         steps_per_epoch=train_generator.samples // BATCH_SIZE,
@@ -175,11 +200,13 @@ def train_model():
         verbose=2
     )
 
-    # 第三阶段：微调训练 Modified
+    # 第三阶段：微调训练 
     print("\n=== 微调阶段 ===")
-    final_model = strip_pruning(pruned_model)  # 移除剪枝包装
+    final_model = build_esp32_model(INPUT_SHAPE,pruning=False,phase='fine_tune') # 加载最佳剪枝模型
+    final_model.load_weights('prune_checkpoint.h5')  # 仅加载权重，保留新结构
+    final_model = strip_pruning(final_model)  # 移除剪枝包装
     final_model.compile(
-        optimizer=optimizers.Nadam(learning_rate=1e-5),  # 更低学习率
+        optimizer=optimizers.Nadam(learning_rate=2e-4,clipnorm=2.0),  # 新增梯度裁剪
         loss='categorical_crossentropy',
         metrics=['accuracy']
     )
@@ -229,9 +256,9 @@ def visualize_training(history):
     # 添加阶段标签 Added
     plt.text(base_end//2, 0.1, 'Base Train', ha='center', va='center', 
             backgroundcolor='w', fontsize=9)
-    plt.text(base_end + (prune_end-base_end)//2, 0.1, '剪枝训练', ha='center', 
+    plt.text(base_end + (prune_end-base_end)//2, 0.1, 'Prune', ha='center', 
             va='center', backgroundcolor='w', fontsize=9)
-    plt.text(prune_end + (total_epochs-prune_end)//2, 0.1, '微调阶段', 
+    plt.text(prune_end + (total_epochs-prune_end)//2, 0.1, 'Fine-tune', 
             ha='center', va='center', backgroundcolor='w', fontsize=9)
     
     plt.title('Accuracy Curve')
@@ -266,3 +293,7 @@ def visualize_training(history):
 
 if __name__ == "__main__":
     train_model()
+
+    import gc
+    gc.collect()
+    tf.keras.backend.clear_session()
