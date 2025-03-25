@@ -180,10 +180,10 @@ def train_model():
     pruned_model.compile(
     optimizer=optimizers.Adam(
             learning_rate = CosineDecayRestarts(
-            initial_learning_rate=3e-4,  # 基础学习率提升50%
-            first_decay_steps=total_steps//3,
-            t_mul=2.0,
-            m_mul=0.7
+            initial_learning_rate=5e-4,  # 基础学习率提升50%
+            first_decay_steps=total_steps//4,
+            t_mul=1.5,
+            m_mul=0.85
         )
     ),
     loss='categorical_crossentropy',
@@ -206,7 +206,7 @@ def train_model():
     final_model.load_weights('prune_checkpoint.h5')  # 仅加载权重，保留新结构
     final_model = strip_pruning(final_model)  # 移除剪枝包装
     final_model.compile(
-        optimizer=optimizers.Nadam(learning_rate=2e-4,clipnorm=2.0),  # 新增梯度裁剪
+        optimizer=optimizers.Nadam(learning_rate=3.5e-4,clipnorm=2.0),  # 新增梯度裁剪
         loss='categorical_crossentropy',
         metrics=['accuracy']
     )
