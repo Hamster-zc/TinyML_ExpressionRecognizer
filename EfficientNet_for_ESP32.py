@@ -10,7 +10,7 @@ from sklearn.metrics import confusion_matrix
 import seaborn as sns
 import os
 from tensorflow_model_optimization.sparsity import keras as sparsity  # 新增剪枝库
-from tensorflow_model_optimization.sparsity.keras import strip_pruning  # 新增
+from tensorflow_model_optimization.sparsity.keras import strip_pruning  # 新增剪枝模型解包
 from tensorflow.keras.experimental import CosineDecayRestarts  # 新增余弦退火学习率
 
 # 模型构建函数（面向嵌入式设备优化）
@@ -88,7 +88,7 @@ def create_callbacks(pruning=False):
         ModelCheckpoint('esp32_model.h5', monitor='val_accuracy', 
                        save_best_only=True, mode='max')
     ]
-    # 添加剪枝回调 Modified
+    # 添加剪枝回调
     if pruning:
         callbacks.append(
             ModelCheckpoint('prune_checkpoint.h5', 
@@ -129,8 +129,8 @@ def train_model():
     EPOCHS = 120
     # 阶段分配调整为：
     # 基础训练：0-60轮 (50%)
-    # 剪枝训练：60-90轮 (25%)
-    # 微调训练：90-120轮 (25%)
+    # 剪枝训练：60-96轮 (30%)
+    # 微调训练：96-120轮 (20%)
     INPUT_SHAPE = (48, 48, 1)
 
     # 数据管道配置
@@ -180,7 +180,7 @@ def train_model():
     pruned_model.compile(
     optimizer=optimizers.Adam(
             learning_rate = CosineDecayRestarts(
-            initial_learning_rate=5e-4,  # 基础学习率提升50%
+            initial_learning_rate=5e-4,  
             first_decay_steps=total_steps//4,
             t_mul=1.5,
             m_mul=0.85
@@ -220,10 +220,10 @@ def train_model():
         verbose=2
     )
 
-    # 保存最终模型 Modified
+    # 保存最终模型 
     final_model.save('esp32_model_pruned.h5')
 
-    # 合并历史记录 Modified
+    # 合并历史记录 
     full_history = {
         'accuracy': history.history['accuracy'] + pruning_history.history['accuracy'] + fine_tune_history.history['accuracy'],
         'val_accuracy': history.history['val_accuracy'] + pruning_history.history['val_accuracy'] + fine_tune_history.history['val_accuracy'],
@@ -239,7 +239,7 @@ def train_model():
 def visualize_training(history):
     plt.figure(figsize=(12, 5))
     
-    # 计算阶段边界 Modified
+    # 计算阶段边界 
     total_epochs = len(history['accuracy'])
     base_end = int(total_epochs * 0.5)   # 基础训练结束位置
     prune_end = base_end + int(total_epochs * 0.3)  # 剪枝训练结束位置
@@ -249,11 +249,11 @@ def visualize_training(history):
     plt.plot(history['accuracy'], label='Training Set')
     plt.plot(history['val_accuracy'], label='Validation Set')
     
-    # 添加阶段分割线 Added
+    # 添加阶段分割线
     plt.axvline(x=base_end, color='r', linestyle='--', linewidth=1, alpha=0.7)
     plt.axvline(x=prune_end, color='g', linestyle='--', linewidth=1, alpha=0.7)
     
-    # 添加阶段标签 Added
+    # 添加阶段标签
     plt.text(base_end//2, 0.1, 'Base Train', ha='center', va='center', 
             backgroundcolor='w', fontsize=9)
     plt.text(base_end + (prune_end-base_end)//2, 0.1, 'Prune', ha='center', 
@@ -271,7 +271,7 @@ def visualize_training(history):
     plt.plot(history['loss'], label='Training Set')
     plt.plot(history['val_loss'], label='Validation Set')
     
-    # 添加阶段分割线 Added
+    # 添加阶段分割线
     plt.axvline(x=base_end, color='r', linestyle='--', linewidth=1, alpha=0.7,
                label='Phase Transition')
     plt.axvline(x=prune_end, color='g', linestyle='--', linewidth=1, alpha=0.7)
@@ -283,7 +283,7 @@ def visualize_training(history):
     
     plt.tight_layout()
     
-    # 添加全局图例说明 Added
+    # 添加全局图例说明
     plt.figtext(0.5, 0.01, 
                f"Phase Division: | 0-{base_end} (Base) | {base_end}-{prune_end} (Prune) | {prune_end}-{total_epochs} (Fine-tune) |",
                ha='center', fontsize=9, color='gray')
