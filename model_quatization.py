@@ -7,8 +7,8 @@ import traceback
 def representative_dataset():
     # 使用验证集作为代表数据集（约10%数据）
     datagen = ImageDataGenerator(
-        rescale=1./127.5 - 1.0,
-        preprocessing_function=lambda x: x * (1 + np.random.uniform(-0.03,0.03)) # 保留亮度抖动
+        rescale=1./127.5 ,
+        preprocessing_function=lambda x: (x - 1) * (1 + np.random.uniform(-0.03,0.03)) # 保留亮度抖动
     )
     generator = datagen.flow_from_directory(
         'Training',
@@ -65,7 +65,8 @@ def verify_quantization():
     output_zero_point = output_details['quantization_parameters']['zero_points'][0]
     
     # 与训练完全一致的数据预处理
-    datagen = ImageDataGenerator(rescale=1./127.5 - 1.0)  # 保持[-1,1]范围
+    datagen = ImageDataGenerator(rescale=1./127.5,
+                                 preprocessing_function=lambda x:x - 1.0)  # 保持[-1,1]范围
     generator = datagen.flow_from_directory(
         'PublicTest',
         target_size=(48, 48),

@@ -64,7 +64,7 @@ def build_esp32_model(input_shape=(48, 48, 1), num_classes=7,pruning=False,phase
 # 数据增强配置（内存高效型）
 def create_datagen():
     return ImageDataGenerator(
-        rescale=1./127.5 - 1.0,  # 归一化到[-1, 1]
+        rescale=1./127.5,  # 归一化到[-1, 1]
         rotation_range=6,         
         width_shift_range=0.08,    # 微调平移范围
         height_shift_range=0.05,
@@ -73,7 +73,7 @@ def create_datagen():
         channel_shift_range=10.0,   # 通道偏移
         horizontal_flip=True,
         fill_mode='constant',       
-        preprocessing_function=lambda x: x * (1 + np.random.uniform(-0.03,0.03)) # 亮度抖动
+        preprocessing_function=lambda x: (x - 1.0) * (1 + np.random.uniform(-0.03,0.03)) # 亮度抖动
     )
 
 # 训练可视化回调
@@ -135,7 +135,8 @@ def train_model():
 
     # 数据管道配置
     train_datagen = create_datagen()
-    val_datagen = ImageDataGenerator(rescale=1./127.5 - 1.0)
+    val_datagen = ImageDataGenerator(rescale=1./127.5,
+                                     preprocessing_function=lambda x: x - 1.0)
 
     # 数据流配置（适配目录结构）
     train_generator = train_datagen.flow_from_directory(
