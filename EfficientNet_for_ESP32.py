@@ -6,12 +6,17 @@ from tensorflow.keras.callbacks import (TensorBoard, EarlyStopping,
                                       ModelCheckpoint, ReduceLROnPlateau)
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.metrics import confusion_matrix
 import seaborn as sns
-import os
-from tensorflow_model_optimization.sparsity import keras as sparsity  # 新增剪枝库
-from tensorflow_model_optimization.sparsity.keras import strip_pruning  # 新增剪枝模型解包
-from tensorflow.keras.experimental import CosineDecayRestarts  # 新增余弦退火学习率
+import os 
+from tensorflow_model_optimization.sparsity.keras import (
+    strip_pruning,
+    UpdatePruningStep,
+    prune_low_magnitude,
+    PolynomialDecay
+)
+
+
+
 
 # 模型构建函数（面向嵌入式设备优化）
 def build_esp32_model(input_shape=(48, 48, 1), num_classes=7,pruning=False,phase='base'):
@@ -25,7 +30,7 @@ def build_esp32_model(input_shape=(48, 48, 1), num_classes=7,pruning=False,phase
 
     reg_config = {
         'base': {'act_l1':1e-6, 'act_l2':1e-5, 'kernel_l1':1e-5, 'kernel_l2':1e-4},
-        'prune': {'act_l1':1e-7, 'act_l2':1e-6, 'kernel_l1':1e-6, 'kernel_l2':1e-5},
+        'prune': {'act_l1':1e-8, 'act_l2':1e-7, 'kernel_l1':0, 'kernel_l2':1e-6},
         'fine_tune': {'act_l1':0, 'act_l2':0, 'kernel_l1':0, 'kernel_l2':0}
     }[phase]
     # 轻量级分类头设计
@@ -42,23 +47,25 @@ def build_esp32_model(input_shape=(48, 48, 1), num_classes=7,pruning=False,phase
     ])
 
     if pruning:
+        total_steps = (28709 // 96) * 36  # 计算总步数
         pruning_params = {
-            'pruning_schedule': sparsity.PolynomialDecay(
+            'pruning_schedule': PolynomialDecay(
                 initial_sparsity=0.20,
-                final_sparsity=0.45,
-                begin_step=2000,
-                end_step=15000,
-                frequency=300
+                final_sparsity=0.75,
+                begin_step=total_steps // 4,
+                end_step=total_steps,
+                frequency=100  
             )
         }
         # 仅对全连接层剪枝
         for i, layer in enumerate(model.layers):
-            if isinstance(layer, layers.Dense):
-                model.layers[i] = sparsity.prune_low_magnitude(layer, **pruning_params)
-    # 计算复杂度分析
-    print("模型参数统计：")
+            if isinstance(layer, layers.Dense) and hasattr(layer, 'kernel'):
+                print(f" 剪枝层 {layer.name} ")  
+                pruned_layer = prune_low_magnitude(layer, **pruning_params)
+                pruned_layer._name = layer.name  # 保留原层名称
+                model.layers[i] = pruned_layer
+
     model.summary()
-    
     return model
 
 # 数据增强配置（内存高效型）
@@ -77,60 +84,61 @@ def create_datagen():
     )
 
 # 训练可视化回调
-def create_callbacks(pruning=False):
+def create_callbacks(pruning=False, phase='base'):
+    """阶段化回调配置
+    Args:
+        pruning (bool): 是否剪枝阶段
+        phase (str): 训练阶段标识 ('base', 'prune', 'fine_tune')
+    """
     callbacks = [
-        TensorBoard(log_dir='./logs', histogram_freq=0, profile_batch=0),
-        EarlyStopping(monitor='val_accuracy', 
-                      patience=15, 
-                      min_delta=0.005,
-                      mode='max',
-                      restore_best_weights=True),
-        ModelCheckpoint('esp32_model.h5', monitor='val_accuracy', 
-                       save_best_only=True, mode='max')
+        TensorBoard(
+            log_dir=f'./logs/{phase}',  # 分阶段日志
+            histogram_freq=0,
+            profile_batch=0
+        ),
+        EarlyStopping(
+            monitor='val_accuracy',
+            patience=15,
+            min_delta=0.005,
+            mode='max',
+            restore_best_weights=True
+        )
     ]
-    # 添加剪枝回调
+    
+    # 分阶段配置模型保存
     if pruning:
-        callbacks.append(
-            ModelCheckpoint('prune_checkpoint.h5', 
+        # 剪枝阶段保存完整模型结构
+        callbacks += [
+            ModelCheckpoint(
+                'prune_checkpoint.h5',
                 monitor='val_accuracy',
                 save_best_only=True,
-                mode='max',
-                save_format='tf')
-)
+                save_weights_only=False,  # 必须保存完整模型
+                save_format='tf',        # 强制TF格式
+                mode='max'
+            )
+        ]
+        callbacks.append(UpdatePruningStep())  # 确保剪枝更新步骤被调用
+    else:
+        # 基础训练和微调阶段的保存路径区分
+        filename = 'base_model.h5' if phase == 'base' else 'fine_tune_model.h5'
+        callbacks.append(
+            ModelCheckpoint(
+                filename,
+                monitor='val_accuracy',
+                save_best_only=True,
+                save_weights_only=False,  # 保存完整模型
+                mode='max'
+            )
+        )
     
     return callbacks
-
-# 混淆矩阵可视化（新增功能）
-def plot_confusion_matrix(model, generator):
-    y_true = generator.classes
-    y_pred = model.predict(generator, steps=generator.samples // generator.batch_size + 1)
-    y_pred_classes = np.argmax(y_pred, axis=1)
-    
-    cm = confusion_matrix(y_true, y_pred_classes)
-    class_names = list(generator.class_indices.keys())
-    
-    plt.figure(figsize=(10,8))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                xticklabels=class_names, 
-                yticklabels=class_names)
-    plt.title('Confusion Matrix')
-    plt.xlabel('Predicted')
-    plt.ylabel('True')
-    plt.xticks(rotation=45)
-    plt.yticks(rotation=0)
-    plt.tight_layout()
-    plt.savefig('confusion_matrix.png', dpi=300)
-    plt.show()
 
 # 训练流程
 def train_model():
     # 超参数配置
     BATCH_SIZE = 96      # 增大批次减少内存碎片
-    EPOCHS = 120
-    # 阶段分配调整为：
-    # 基础训练：0-60轮 (50%)
-    # 剪枝训练：60-96轮 (30%)
-    # 微调训练：96-120轮 (20%)
+    EPOCHS = 96
     INPUT_SHAPE = (48, 48, 1)
 
     # 数据管道配置
@@ -164,65 +172,88 @@ def train_model():
         loss='categorical_crossentropy',
         metrics=['accuracy']
     )
+    base_epochs = 36
     history = model.fit(
         train_generator,
         steps_per_epoch=train_generator.samples // BATCH_SIZE,
-        epochs=int(EPOCHS*0.5),  # 50%训练时间用于基础训练
+        epochs=base_epochs,
         validation_data=val_generator,
-        validation_steps=val_generator.samples // BATCH_SIZE,
-        callbacks=create_callbacks(pruning=False),
+        callbacks=create_callbacks(pruning=False,phase='base'),
         verbose=2
     )
+    model.save('esp32_model.h5')  # 保存基础模型
 
     # 第二阶段：剪枝训练 
     print("\n=== 剪枝训练阶段 ===")
     pruned_model = build_esp32_model(INPUT_SHAPE, phase='prune',pruning=True)
-    total_steps = (train_generator.samples // BATCH_SIZE) * int(EPOCHS*0.3)  # 计算总步数
+    pruned_model.load_weights('esp32_model.h5', by_name=True)  # 加载基础模型权重
+    # 添加剪枝回调
+    pruning_callbacks = create_callbacks(pruning=True, phase='prune')
+    # 添加额外的剪枝回调以确保执行
+    if not any(isinstance(cb, UpdatePruningStep) for cb in pruning_callbacks):
+        print("添加 UpdatePruningStep 回调...")
+        pruning_callbacks.append(UpdatePruningStep())
+
+    total_steps = (train_generator.samples // BATCH_SIZE) * 36
     pruned_model.compile(
-    optimizer=optimizers.Adam(
-            learning_rate = CosineDecayRestarts(
-            initial_learning_rate=5e-4,  
-            first_decay_steps=total_steps//4,
-            t_mul=1.5,
-            m_mul=0.85
-        )
-    ),
-    loss='categorical_crossentropy',
-    metrics=['accuracy']
-)
-    
+            optimizer=optimizers.Adam(learning_rate=1e-4),
+            loss='categorical_crossentropy',
+            metrics=['accuracy']
+    )
+
     pruning_history = pruned_model.fit(
         train_generator,
-        steps_per_epoch=train_generator.samples // BATCH_SIZE,
-        epochs=int(EPOCHS*0.3),  # 30%时间用于剪枝
+        epochs=36, 
+        initial_epoch=0,
         validation_data=val_generator,
-        validation_steps=val_generator.samples // BATCH_SIZE,
-        callbacks=create_callbacks(pruning=True),
+        callbacks=pruning_callbacks,
         verbose=2
     )
 
+    print("\n剪枝层稀疏度分析：")
+    for layer in pruned_model.layers:
+        if hasattr(layer, 'pruning'):
+            weight = layer.weights[0].numpy()
+            sparsity = 1.0 - np.count_nonzero(weight) / weight.size
+            print(f"  ├─ {layer.name}: 实际稀疏度 {sparsity:.2%}")
+
+    pruned_model.save('pruned_model.h5')  # 保存剪枝后的模型
+    
+    # 确保剪枝检查点存在
+    if not os.path.exists('prune_checkpoint.h5'):
+        print("警告：剪枝检查点未创建，保存最终模型作为备选")
+        pruned_model.save('prune_checkpoint.h5')
+
     # 第三阶段：微调训练 
     print("\n=== 微调阶段 ===")
-    final_model = build_esp32_model(INPUT_SHAPE,pruning=False,phase='fine_tune') # 加载最佳剪枝模型
-    final_model.load_weights('prune_checkpoint.h5')  # 仅加载权重，保留新结构
-    final_model = strip_pruning(final_model)  # 移除剪枝包装
+    if os.path.exists('prune_checkpoint.h5'):
+        print("加载剪枝检查点模型...")
+        try:
+            final_model = tf.keras.models.load_model('prune_checkpoint.h5')
+        except Exception as e:
+            print(f"加载剪枝模型失败: {e}")
+            print("尝试重建模型结构并加载权重...")
+            final_model = build_esp32_model(INPUT_SHAPE, pruning=False, phase='fine_tune')
+            final_model.load_weights('prune_checkpoint.h5', by_name=True)
+    else:
+        print("警告：找不到剪枝检查点，使用剪枝训练结束时的模型")
+        final_model = pruned_model
+    # 移除剪枝包装
+    final_model = strip_pruning(final_model)
+
     final_model.compile(
-        optimizer=optimizers.Nadam(learning_rate=3.5e-4,clipnorm=2.0),  # 新增梯度裁剪
+        optimizer=optimizers.Nadam(learning_rate=1e-4,clipnorm=1.0),  # 新增梯度裁剪
         loss='categorical_crossentropy',
         metrics=['accuracy']
     )
     fine_tune_history = final_model.fit(
         train_generator,
-        steps_per_epoch=train_generator.samples // BATCH_SIZE,
-        epochs=int(EPOCHS*0.2),  # 20%时间用于微调
+        epochs=24,
+        initial_epoch=0,
         validation_data=val_generator,
-        validation_steps=val_generator.samples // BATCH_SIZE,
         callbacks=create_callbacks(pruning=False),
         verbose=2
     )
-
-    # 保存最终模型 
-    final_model.save('esp32_model_pruned.h5')
 
     # 合并历史记录 
     full_history = {
@@ -232,19 +263,20 @@ def train_model():
         'val_loss': history.history['val_loss'] + pruning_history.history['val_loss'] + fine_tune_history.history['val_loss']
     }
 
+    # 保存最终模型 
+    final_model.save('esp32_model_pruned.h5')
     # 训练过程可视化
+
     visualize_training(full_history)
-    # 生成混淆矩阵
-    plot_confusion_matrix(final_model, val_generator)
 
 def visualize_training(history):
     plt.figure(figsize=(12, 5))
     
     # 计算阶段边界 
     total_epochs = len(history['accuracy'])
-    base_end = int(total_epochs * 0.5)   # 基础训练结束位置
-    prune_end = base_end + int(total_epochs * 0.3)  # 剪枝训练结束位置
-    
+    base_end = 36
+    prune_end = 72
+
     # ------------------- 准确率曲线 -------------------
     plt.subplot(1, 2, 1)
     plt.plot(history['accuracy'], label='Training Set')
@@ -293,6 +325,14 @@ def visualize_training(history):
     plt.show()
 
 if __name__ == "__main__":
+    # 打印当前目录文件（调试用）
+    print("当前目录文件:", os.listdir('.'))
+    
+    # 确保日志目录存在
+    os.makedirs('./logs/base', exist_ok=True)
+    os.makedirs('./logs/prune', exist_ok=True)
+    os.makedirs('./logs/fine_tune', exist_ok=True)
+
     train_model()
 
     import gc
