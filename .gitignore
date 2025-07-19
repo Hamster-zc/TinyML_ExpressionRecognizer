@@ -1,0 +1,34 @@
+#忽略所有图片
+*.png
+*.jpg
+*.jpeg
+
+#忽略文件夹
+PrivateTest/
+PublicTest/
+Training/
+logs/
+
+# PlatformIO
+.pio/
+.vscode/
+*.env
+
+# 编译输出
+build/
+*.bin
+*.elf
+*.map
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# .h5文件
+*.h5
+
+# .tflite文件
+*.tflite
+
+# .txt文件
+*.txt
